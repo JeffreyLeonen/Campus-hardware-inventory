@@ -1,1 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Laboratory System{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="{{ url_for('dashboard') if session.get('username') else url_for('login') }}">
+      <span class="brand-mark">NU</span>
+      <span><strong>LABORATORY SYSTEM</strong><small>NU Hardware Inventory</small></span>
+    </a>
+    {% if session.get('username') %}
+    <nav class="top-nav">
+      <a href="{{ url_for('dashboard') }}">Dashboard</a>
+      <span class="user-pill">
+        <span class="avatar">{{ session.get('username')[0]|upper }}</span>
+        <span>{{ session.get('username') }}</span>
+        <b>{{ session.get('role') }}</b>
+      </span>
+      <a class="logout-link" href="{{ url_for('logout') }}">Logout</a>
+    </nav>
+    {% endif %}
+  </div>
+</header>
+<main class="page-shell">
+  {% with messages=get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <section class="messages" aria-live="polite">
+      {% for category,msg in messages %}
+        <div class="message {{ category }}"><span class="message-icon">{% if category == 'success' %}✓{% elif category == 'warning' %}⚠{% else %}!{% endif %}</span><span>{{ msg }}</span></div>
+      {% endfor %}
+      </section>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<footer class="site-footer">Laboratory System · Web version of the original Python desktop application</footer>
+</body>
+</html>
 
