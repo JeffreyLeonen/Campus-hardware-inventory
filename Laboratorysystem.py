@@ -1,0 +1,1525 @@
+import csv
+import logging
+import os
+import re
+import sqlite3
+import tkinter as tk
+from datetime import datetime
+from tkinter import messagebox, ttk
+
+import bcrypt
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# ==============================================================================
+# 1. CENTRAL FILE LOGGING SETUP (logger.py)
+# ==============================================================================
+if not os.path.exists("app_logging"):
+    os.makedirs("app_logging")
+
+logging.basicConfig(
+    filename=os.path.join("app_logging", "app.log"),
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("HardwareApp")
+
+# ==============================================================================
+# 2. DATABASE INITIALIZATION & MIGRATION
+# ==============================================================================
+DB_NAME = "hardware_inventory.db"
+
+
+def init_db():
+    """Initializes tables and migrates schemas to support history & RETURN_PENDING."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+
+        # 1. Base Users Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT NOT NULL DEFAULT 'user@campus.edu',
+                password_hash TEXT NOT NULL,
+                role TEXT CHECK(role IN ('ADMIN', 'USER')) NOT NULL DEFAULT 'USER',
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                is_locked INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # Users table auto-migration
+        cursor.execute("PRAGMA table_info(users)")
+        existing_cols = [col[1] for col in cursor.fetchall()]
+        if "email" not in existing_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT 'user@campus.edu'")
+        if "role" not in existing_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'USER'")
+        if "failed_attempts" not in existing_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0")
+        if "is_locked" not in existing_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0")
+
+        # 2. Password Reset Requests Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS password_resets (
+                request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
+                new_password_hash TEXT NOT NULL,
+                request_time TEXT NOT NULL,
+                status TEXT CHECK(status IN ('PENDING', 'APPROVED', 'REJECTED')) NOT NULL DEFAULT 'PENDING'
+            )
+        """)
+
+        # 3. Hardware Inventory Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS hardware (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+
+        # 4. Loans Table Auto-Migration for borrow/return approval statuses
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='loans'")
+        table_def = cursor.fetchone()
+
+        if table_def and "PENDING_BORROW" not in table_def[0]:
+            cursor.execute("ALTER TABLE loans RENAME TO old_loans")
+            cursor.execute("""
+                CREATE TABLE loans (
+                    loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    borrow_date TEXT NOT NULL,
+                    return_date TEXT,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    status TEXT CHECK(status IN ('PENDING_BORROW', 'BORROWED', 'RETURN_PENDING', 'RETURNED')) NOT NULL DEFAULT 'PENDING_BORROW'
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO loans (loan_id, username, item_id, item_name, borrow_date, return_date, status)
+                SELECT loan_id, username, item_id, item_name, borrow_date, return_date, status FROM old_loans
+            """)
+            cursor.execute("DROP TABLE old_loans")
+            logger.info("Migrated 'loans' table constraint to include RETURN_PENDING.")
+        else:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS loans (
+                    loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    borrow_date TEXT NOT NULL,
+                    return_date TEXT,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    status TEXT CHECK(status IN ('PENDING_BORROW', 'BORROWED', 'RETURN_PENDING', 'RETURNED')) NOT NULL DEFAULT 'PENDING_BORROW'
+                )
+            """)
+
+        # 4.1 Loans quantity migration for databases created by earlier web versions
+        cursor.execute("PRAGMA table_info(loans)")
+        loan_columns = [row[1] for row in cursor.fetchall()]
+        if "quantity" not in loan_columns:
+            cursor.execute("ALTER TABLE loans ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1")
+            logger.info("Migrated 'loans' table to include borrow quantity.")
+
+        # 5. Seed Default Admin
+        cursor.execute("SELECT id FROM users WHERE username = 'admin'")
+        if not cursor.fetchone():
+            default_admin_pw = "Admin1234#"
+            hashed_admin_pw = bcrypt.hashpw(
+                default_admin_pw.encode("utf-8"), bcrypt.gensalt()
+            ).decode("utf-8")
+            cursor.execute(
+                "INSERT INTO users (username, email, password_hash, role, failed_attempts, is_locked) VALUES (?, ?, ?, ?, 0, 0)",
+                ("admin", "admin@campus.edu", hashed_admin_pw, "ADMIN"),
+            )
+            logger.info("Default Admin account seeded: admin / Admin1234#")
+
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully.")
+    except sqlite3.Error as e:
+        logger.error(f"Database setup error: {e}")
+
+
+# ==============================================================================
+# 3. PYDANTIC INPUT VALIDATION SCHEMAS
+# ==============================================================================
+class UserSecuritySchema(BaseModel):
+    username: str = Field(..., min_length=3, max_length=20)
+    email: str
+    password: str = Field(..., min_length=8)
+    role: str = Field(default="USER")
+
+    @field_validator("username")
+    def username_alphanumeric(cls, v):
+        if not re.match(r"^[a-zA-Z0-9_]+$", v):
+            raise ValueError("Username must contain only letters, numbers, and underscores.")
+        return v
+
+    @field_validator("email")
+    def email_format(cls, v):
+        pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
+        if not re.match(pattern, v):
+            raise ValueError("Please provide a valid email format (e.g., student@campus.edu).")
+        return v
+
+    @field_validator("password")
+    def password_complexity(cls, v):
+        if not re.search(r"[a-z]", v):
+            raise ValueError("Password must contain at least one lowercase letter.")
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("Password must contain at least one uppercase letter.")
+        if not re.search(r"\d", v):
+            raise ValueError("Password must contain at least one number.")
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", v):
+            raise ValueError("Password must contain at least one special character (!@#$%^&*).")
+        return v
+
+
+class HardwareSchema(BaseModel):
+    item_name: str = Field(..., min_length=2, max_length=50)
+    category: str = Field(..., min_length=2, max_length=30)
+    quantity: int = Field(..., ge=0)
+    unit_price: float = Field(..., gt=0)
+
+
+def calculate_status(quantity: int) -> str:
+    """Computes condition status automatically based on quantity rules[cite: 1]."""
+    if quantity > 5:
+        return "In Stock"
+    elif 1 <= quantity <= 5:
+        return "Low Stock"
+    else:
+        return "Out of Stock"
+
+
+# ==============================================================================
+# 4. CONTROLLER LAYER
+# ==============================================================================
+class AuthController:
+    @staticmethod
+    def register_user(username, email, password, role="USER"):
+        try:
+            validated = UserSecuritySchema(
+                username=username, email=email, password=password, role=role
+            )
+        except ValidationError as e:
+            return False, f"Validation Error: {e.errors()[0]['msg']}"
+
+        hashed_pw = bcrypt.hashpw(validated.password.encode("utf-8"), bcrypt.gensalt())
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO users (username, email, password_hash, role, failed_attempts, is_locked)
+                VALUES (?, ?, ?, ?, 0, 0)
+                """,
+                (validated.username, validated.email, hashed_pw.decode("utf-8"), validated.role),
+            )
+            conn.commit()
+            conn.close()
+            logger.info(f"User registered: '{validated.username}' (Role: {validated.role})")
+            return True, "Registration successful! You may now log in."
+        except sqlite3.IntegrityError:
+            return False, "Username or Email address already exists."
+
+    @staticmethod
+    def login_user(username, password):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT password_hash, role, failed_attempts, is_locked, email FROM users WHERE username = ?",
+            (username,),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return False, "Invalid username or password.", None, False, None
+
+        stored_hash, role, failed_attempts, is_locked, email = row
+
+        if is_locked == 1:
+            conn.close()
+            return False, "Account is LOCKED due to 3 failed attempts.\nPlease submit a Password Reset Request.", None, True, None
+
+        if bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8")):
+            cursor.execute("UPDATE users SET failed_attempts = 0 WHERE username = ?", (username,))
+            conn.commit()
+            conn.close()
+            logger.info(f"User '{username}' logged in successfully as [{role}].")
+            return True, "Login successful!", role, False, email
+        else:
+            new_failed = failed_attempts + 1
+            if new_failed >= 3:
+                cursor.execute(
+                    "UPDATE users SET failed_attempts = ?, is_locked = 1 WHERE username = ?",
+                    (new_failed, username),
+                )
+                conn.commit()
+                conn.close()
+                return False, "Account has been LOCKED due to 3 failed attempts.\nReset password to regain access.", None, True, None
+            else:
+                cursor.execute(
+                    "UPDATE users SET failed_attempts = ? WHERE username = ?",
+                    (new_failed, username),
+                )
+                conn.commit()
+                conn.close()
+                remaining = 3 - new_failed
+                return False, f"Invalid username or password. ({remaining} attempt(s) left before lockout)", None, False, None
+
+    @staticmethod
+    def submit_password_reset_request(username, email, new_password):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM users WHERE username = ? AND email = ?", (username, email))
+        if not cursor.fetchone():
+            conn.close()
+            return False, "Validation Error: Username and registered Email address do not match."
+
+        cursor.execute(
+            "SELECT request_id FROM password_resets WHERE username = ? AND status = 'PENDING'",
+            (username,),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return False, "You already have a pending reset request awaiting Admin approval."
+
+        try:
+            validated = UserSecuritySchema(username=username, email=email, password=new_password)
+        except ValidationError as e:
+            conn.close()
+            return False, f"Password Security Error: {e.errors()[0]['msg']}"
+
+        hashed_pw = bcrypt.hashpw(validated.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            """
+            INSERT INTO password_resets (username, email, new_password_hash, request_time, status)
+            VALUES (?, ?, ?, ?, 'PENDING')
+            """,
+            (username, email, hashed_pw, current_timestamp),
+        )
+        conn.commit()
+        conn.close()
+        return True, f"Reset request submitted at {current_timestamp}.\nOnce an Admin approves it, your account will unlock."
+
+    @staticmethod
+    def get_pending_resets():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT request_id, username, email, request_time FROM password_resets WHERE status = 'PENDING'")
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_reset_history():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT request_id, username, email, request_time, status FROM password_resets WHERE status != 'PENDING' ORDER BY request_id DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def process_bulk_resets(request_ids, approve=True):
+        if not request_ids:
+            return False, "No requests selected."
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        count = 0
+
+        for r_id in request_ids:
+            cursor.execute(
+                "SELECT username, new_password_hash FROM password_resets WHERE request_id = ? AND status = 'PENDING'",
+                (r_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                username, new_hash = row
+                if approve:
+                    cursor.execute(
+                        "UPDATE users SET password_hash = ?, failed_attempts = 0, is_locked = 0 WHERE username = ?",
+                        (new_hash, username),
+                    )
+                    cursor.execute("UPDATE password_resets SET status = 'APPROVED' WHERE request_id = ?", (r_id,))
+                else:
+                    cursor.execute("UPDATE password_resets SET status = 'REJECTED' WHERE request_id = ?", (r_id,))
+                count += 1
+
+        conn.commit()
+        conn.close()
+        action = "approved & unlocked" if approve else "rejected"
+        return True, f"Successfully {action} {count} request(s)."
+
+    @staticmethod
+    def change_password_direct(username, email, old_password, new_password):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+
+        if not row or not bcrypt.checkpw(old_password.encode("utf-8"), row[0].encode("utf-8")):
+            conn.close()
+            return False, "Incorrect current password."
+
+        try:
+            validated = UserSecuritySchema(username=username, email=email, password=new_password)
+        except ValidationError as e:
+            conn.close()
+            return False, e.errors()[0]["msg"]
+
+        hashed_pw = bcrypt.hashpw(validated.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cursor.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hashed_pw, username))
+        conn.commit()
+        conn.close()
+        return True, "Password updated successfully!"
+
+
+class InventoryController:
+    @staticmethod
+    def add_item(item_name, category, quantity, unit_price):
+        try:
+            val = HardwareSchema(
+                item_name=item_name, category=category, quantity=quantity, unit_price=unit_price
+            )
+        except ValidationError as e:
+            return False, f"Validation Error: {e.errors()[0]['msg']}"
+
+        status = calculate_status(val.quantity)
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO hardware (item_name, category, quantity, unit_price, status)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (val.item_name, val.category, val.quantity, val.unit_price, status),
+            )
+            conn.commit()
+            conn.close()
+            return True, "Hardware item added successfully!"
+        except sqlite3.Error as e:
+            return False, f"Database insertion failed: {e}"
+
+    @staticmethod
+    def delete_bulk_items(item_ids):
+        if not item_ids:
+            return False, "No items selected."
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.executemany("DELETE FROM hardware WHERE item_id = ?", [(i,) for i in item_ids])
+            conn.commit()
+            conn.close()
+            return True, f"Successfully deleted {len(item_ids)} item(s)."
+        except sqlite3.Error as e:
+            return False, f"Database deletion failed: {e}"
+
+    @staticmethod
+    def get_all_items(search_text="", category="ALL"):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        query = "SELECT item_id, item_name, category, quantity, unit_price, status FROM hardware WHERE item_name LIKE ?"
+        params = [f"%{search_text}%"]
+
+        if category != "ALL":
+            query += " AND category = ?"
+            params.append(category)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_categories():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT category FROM hardware")
+        rows = [r[0] for r in cursor.fetchall() if r[0]]
+        conn.close()
+        return ["ALL"] + sorted(rows)
+
+    @staticmethod
+    def get_total_asset_value():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT SUM(quantity * unit_price) FROM hardware")
+        total = cursor.fetchone()[0]
+        conn.close()
+        return total if total else 0.0
+
+    @staticmethod
+    def borrow_item(username, item_id, quantity=1):
+        """Create a borrow request for the requested quantity. Stock changes only after Admin approval."""
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return False, "Borrow quantity must be a whole number."
+        if quantity < 1:
+            return False, "Borrow quantity must be at least 1."
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT item_name, quantity FROM hardware WHERE item_id = ?", (item_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, "Item not found."
+
+        item_name, available_qty = row
+        if available_qty <= 0:
+            conn.close()
+            return False, f"'{item_name}' is currently Out of Stock!"
+        if quantity > available_qty:
+            conn.close()
+            return False, f"Only {available_qty} unit(s) of '{item_name}' are available."
+
+        cursor.execute(
+            "SELECT loan_id FROM loans WHERE username = ? AND item_id = ? AND status = 'PENDING_BORROW'",
+            (username, item_id),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return False, f"A borrow request for '{item_name}' is already awaiting Admin approval."
+
+        borrow_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            """
+            INSERT INTO loans (username, item_id, item_name, borrow_date, quantity, status)
+            VALUES (?, ?, ?, ?, ?, 'PENDING_BORROW')
+            """,
+            (username, item_id, item_name, borrow_time, quantity),
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"User '{username}' requested to borrow {quantity} unit(s) of '{item_name}' (ID: {item_id}).")
+        return True, f"Borrow request submitted for {quantity} unit(s) of '{item_name}'. Awaiting Admin approval."
+
+    @staticmethod
+    def get_pending_borrows():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, username, item_name, quantity, borrow_date FROM loans WHERE status = 'PENDING_BORROW' ORDER BY loan_id DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_user_pending_borrows(username):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, item_name, quantity, borrow_date, status FROM loans WHERE username = ? AND status = 'PENDING_BORROW' ORDER BY loan_id DESC",
+            (username,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def process_bulk_borrows(loan_ids, approve=True):
+        if not loan_ids:
+            return False, "No borrow requests selected."
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        count = 0
+
+        for l_id in loan_ids:
+            cursor.execute(
+                "SELECT item_id, item_name, username, quantity FROM loans WHERE loan_id = ? AND status = 'PENDING_BORROW'",
+                (l_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                continue
+
+            item_id, item_name, username, requested_qty = row
+            requested_qty = max(1, int(requested_qty or 1))
+            if approve:
+                cursor.execute("SELECT quantity FROM hardware WHERE item_id = ?", (item_id,))
+                hw_row = cursor.fetchone()
+                if not hw_row or hw_row[0] < requested_qty:
+                    continue
+                new_qty = hw_row[0] - requested_qty
+                cursor.execute(
+                    "UPDATE hardware SET quantity = ?, status = ? WHERE item_id = ?",
+                    (new_qty, calculate_status(new_qty), item_id),
+                )
+                cursor.execute("UPDATE loans SET status = 'BORROWED' WHERE loan_id = ?", (l_id,))
+            else:
+                # Keep the record for audit/history; a rejected request is marked RETURNED
+                # as a legacy-compatible terminal state.
+                cursor.execute("UPDATE loans SET status = 'RETURNED', return_date = ? WHERE loan_id = ?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), l_id))
+            count += 1
+
+        conn.commit()
+        conn.close()
+        action = "approved" if approve else "rejected"
+        return True, f"Successfully {action} {count} borrow request(s)."
+
+    @staticmethod
+    def request_bulk_item_returns(loan_ids):
+        if not loan_ids:
+            return False, "No items selected."
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        return_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        count = 0
+
+        for l_id in loan_ids:
+            cursor.execute(
+                "UPDATE loans SET status = 'RETURN_PENDING', return_date = ? WHERE loan_id = ? AND status = 'BORROWED'",
+                (return_time, l_id),
+            )
+            if cursor.rowcount > 0:
+                count += 1
+
+        conn.commit()
+        conn.close()
+        if count > 0:
+            return True, f"Return request submitted for {count} item(s)! Awaiting Admin check."
+        return False, "Selected items are already pending return approval."
+
+    @staticmethod
+    def get_pending_returns():
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, username, item_name, quantity, borrow_date, return_date FROM loans WHERE status = 'RETURN_PENDING'"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def process_bulk_returns(loan_ids, approve=True):
+        if not loan_ids:
+            return False, "No return requests selected."
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        count = 0
+
+        for l_id in loan_ids:
+            cursor.execute("SELECT item_id, item_name, username, quantity FROM loans WHERE loan_id = ? AND status = 'RETURN_PENDING'", (l_id,))
+            row = cursor.fetchone()
+            if row:
+                item_id, item_name, username, borrowed_qty = row
+                borrowed_qty = max(1, int(borrowed_qty or 1))
+                if approve:
+                    cursor.execute("SELECT quantity FROM hardware WHERE item_id = ?", (item_id,))
+                    hw_row = cursor.fetchone()
+                    if hw_row:
+                        new_qty = hw_row[0] + borrowed_qty
+                        new_status = calculate_status(new_qty)
+                        cursor.execute("UPDATE hardware SET quantity = ?, status = ? WHERE item_id = ?", (new_qty, new_status, item_id))
+                    cursor.execute("UPDATE loans SET status = 'RETURNED' WHERE loan_id = ?", (l_id,))
+                else:
+                    cursor.execute("UPDATE loans SET status = 'BORROWED', return_date = NULL WHERE loan_id = ?", (l_id,))
+                count += 1
+
+        conn.commit()
+        conn.close()
+        action = "approved & restocked" if approve else "rejected (reverted to BORROWED)"
+        return True, f"Successfully {action} {count} return request(s)."
+
+    @staticmethod
+    def get_user_active_loans(username):
+        """Fetches currently borrowed and return-pending items for a user."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, item_name, quantity, borrow_date, status FROM loans WHERE username = ? AND status IN ('BORROWED', 'RETURN_PENDING') ORDER BY loan_id DESC",
+            (username,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_user_loan_history(username):
+        """Fetches full borrow/return history for a specific user."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, item_name, quantity, borrow_date, return_date, status FROM loans WHERE username = ? ORDER BY loan_id DESC",
+            (username,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def get_all_loans_history():
+        """Fetches global borrow and return audit history for Admins."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loan_id, username, item_name, quantity, borrow_date, return_date, status FROM loans ORDER BY loan_id DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    @staticmethod
+    def export_to_csv(active_user):
+        items = InventoryController.get_all_items()
+        file_path = "inventory_report.csv"
+        try:
+            with open(file_path, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["ID", "Item Name", "Category", "Quantity", "Unit Price (P)", "Status"])
+                writer.writerows(items)
+            logger.info(f"CSV Report generated by user '{active_user}'.")
+            return True, f"Inventory exported successfully to '{file_path}'!"
+        except Exception as e:
+            return False, f"Failed to export report: {e}"
+
+
+# ==============================================================================
+# 5. VIEWS (GUI INTERFACES)
+# ==============================================================================
+class AuthView:
+    def __init__(self, root, on_success):
+        self.root = root
+        self.on_success = on_success
+        self.root.title("System Auth - Hardware Inventory")
+        self.root.geometry("450x510")
+        self.root.resizable(False, False)
+
+        tk.Label(root, text="Campus Hardware Inventory", font=("Arial", 13, "bold")).pack(pady=10)
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        self.tab_login = ttk.Frame(self.notebook)
+        self.tab_register = ttk.Frame(self.notebook)
+        self.tab_forgot = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab_login, text="  Login  ")
+        self.notebook.add(self.tab_register, text="  Register  ")
+        self.notebook.add(self.tab_forgot, text="  Reset / Unlock Password  ")
+
+        self.build_login_tab()
+        self.build_register_tab()
+        self.build_forgot_tab()
+
+    def build_login_tab(self):
+        f = self.tab_login
+        tk.Label(f, text="Username:").pack(anchor="w", padx=30, pady=(20, 2))
+        self.ent_login_user = tk.Entry(f, width=34)
+        self.ent_login_user.pack(padx=30, pady=(0, 10))
+
+        tk.Label(f, text="Password:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_login_pass = tk.Entry(f, show="*", width=34)
+        self.ent_login_pass.pack(padx=30, pady=(0, 5))
+
+        self.show_login_pw = tk.BooleanVar()
+        tk.Checkbutton(
+            f, text="Show Password", variable=self.show_login_pw,
+            command=lambda: self.toggle_pw(self.ent_login_pass, self.show_login_pw),
+        ).pack(anchor="w", padx=30, pady=(0, 10))
+
+        tk.Button(
+            f, text="Login to System", command=self.handle_login,
+            bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), width=22,
+        ).pack(pady=10)
+
+        tk.Label(
+            f, text="* Note: 3 consecutive incorrect passwords will lock your account.",
+            font=("Arial", 8, "italic"), fg="#777",
+        ).pack(pady=(5, 0))
+
+    def build_register_tab(self):
+        f = self.tab_register
+        tk.Label(f, text="Username:").pack(anchor="w", padx=30, pady=(10, 2))
+        self.ent_reg_user = tk.Entry(f, width=34)
+        self.ent_reg_user.pack(padx=30, pady=(0, 6))
+
+        tk.Label(f, text="Email Address:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_reg_email = tk.Entry(f, width=34)
+        self.ent_reg_email.pack(padx=30, pady=(0, 6))
+
+        tk.Label(f, text="Password:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_reg_pass = tk.Entry(f, show="*", width=34)
+        self.ent_reg_pass.pack(padx=30, pady=(0, 6))
+
+        tk.Label(f, text="Select Role:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.combo_role = ttk.Combobox(f, values=["USER", "ADMIN"], state="readonly", width=32)
+        self.combo_role.current(0)
+        self.combo_role.pack(padx=30, pady=(0, 15))
+
+        tk.Button(
+            f, text="Create Account", command=self.handle_register,
+            bg="#2196F3", fg="white", font=("Arial", 10, "bold"), width=22,
+        ).pack(pady=5)
+
+    def build_forgot_tab(self):
+        f = self.tab_forgot
+        tk.Label(f, text="Account Username:").pack(anchor="w", padx=30, pady=(10, 2))
+        self.ent_fg_user = tk.Entry(f, width=34)
+        self.ent_fg_user.pack(padx=30, pady=(0, 5))
+
+        tk.Label(f, text="Registered Email:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_fg_email = tk.Entry(f, width=34)
+        self.ent_fg_email.pack(padx=30, pady=(0, 5))
+
+        tk.Label(f, text="Desired New Password:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_fg_pass = tk.Entry(f, show="*", width=34)
+        self.ent_fg_pass.pack(padx=30, pady=(0, 5))
+
+        tk.Label(f, text="Confirm New Password:").pack(anchor="w", padx=30, pady=(0, 2))
+        self.ent_fg_confirm = tk.Entry(f, show="*", width=34)
+        self.ent_fg_confirm.pack(padx=30, pady=(0, 10))
+
+        tk.Button(
+            f, text="Submit Reset / Unlock Request", command=self.handle_submit_reset,
+            bg="#FF9800", fg="white", font=("Arial", 9, "bold"), width=28,
+        ).pack(pady=5)
+
+    def toggle_pw(self, entry_widget, bool_var):
+        entry_widget.config(show="" if bool_var.get() else "*")
+
+    def handle_login(self):
+        u = self.ent_login_user.get().strip()
+        p = self.ent_login_pass.get().strip()
+
+        if not u or not p:
+            messagebox.showerror("Error", "Username and password are required.")
+            return
+
+        ok, msg, role, is_locked, email = AuthController.login_user(u, p)
+        if ok:
+            messagebox.showinfo("Success", msg)
+            self.on_success(u, role, email)
+        else:
+            if is_locked:
+                messagebox.showerror("Account Locked", msg)
+                self.notebook.select(self.tab_forgot)
+                self.ent_fg_user.delete(0, tk.END)
+                self.ent_fg_user.insert(0, u)
+            else:
+                messagebox.showerror("Authentication Failed", msg)
+
+    def handle_register(self):
+        u = self.ent_reg_user.get().strip()
+        e = self.ent_reg_email.get().strip()
+        p = self.ent_reg_pass.get().strip()
+        r = self.combo_role.get()
+
+        if not u or not e or not p:
+            messagebox.showerror("Error", "All registration fields are required.")
+            return
+
+        ok, msg = AuthController.register_user(u, e, p, role=r)
+        if ok:
+            messagebox.showinfo("Success", msg)
+            self.notebook.select(self.tab_login)
+            self.ent_login_user.delete(0, tk.END)
+            self.ent_login_user.insert(0, u)
+        else:
+            messagebox.showwarning("Registration Alert", msg)
+
+    def handle_submit_reset(self):
+        u = self.ent_fg_user.get().strip()
+        e = self.ent_fg_email.get().strip()
+        p1 = self.ent_fg_pass.get().strip()
+        p2 = self.ent_fg_confirm.get().strip()
+
+        if not u or not e or not p1 or not p2:
+            messagebox.showerror("Error", "All fields are required.")
+            return
+
+        if p1 != p2:
+            messagebox.showerror("Mismatch Error", "New passwords do not match.")
+            return
+
+        ok, msg = AuthController.submit_password_reset_request(u, e, p1)
+        if ok:
+            messagebox.showinfo("Request Submitted", msg)
+            self.notebook.select(self.tab_login)
+            self.ent_fg_user.delete(0, tk.END)
+            self.ent_fg_email.delete(0, tk.END)
+            self.ent_fg_pass.delete(0, tk.END)
+            self.ent_fg_confirm.delete(0, tk.END)
+        else:
+            messagebox.showerror("Reset Request Failed", msg)
+
+
+class InventoryView:
+    def __init__(self, root, active_user, role, email, on_logout):
+        self.root = root
+        self.active_user = active_user
+        self.role = role
+        self.email = email
+        self.on_logout = on_logout
+
+        # Selection tracking sets for checkboxes
+        self.selected_inv_ids = set()
+        self.selected_reset_ids = set()
+        self.selected_return_ids = set()
+        self.selected_loan_ids = set()
+
+        self.root.title(f"Campus Hardware Inventory System ({self.role} PANEL)")
+        self.root.geometry("980x760")
+
+        # Header Bar
+        frame_header = tk.Frame(root, bg="#212121", pady=6)
+        frame_header.pack(fill="x")
+
+        role_badge = f"[{self.role}]"
+        badge_color = "#FFD54F" if self.role == "ADMIN" else "#81D4FA"
+
+        tk.Label(
+            frame_header, text=f"Logged in as: {active_user} ",
+            font=("Arial", 10, "bold"), bg="#212121", fg="white",
+        ).pack(side="left", padx=(15, 0))
+
+        tk.Label(
+            frame_header, text=role_badge,
+            font=("Arial", 10, "bold"), bg="#212121", fg=badge_color,
+        ).pack(side="left")
+
+        tk.Button(
+            frame_header, text="Logout", command=self.logout,
+            bg="#F44336", fg="white", font=("Arial", 9, "bold"),
+        ).pack(side="right", padx=15)
+
+        # Tabbed Layout
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.tab_inventory = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_inventory, text="  Hardware Catalog  ")
+
+        if self.role == "USER":
+            self.tab_loans = ttk.Frame(self.notebook)
+            self.notebook.add(self.tab_loans, text="  My Active & Loan History  ")
+            self.build_loans_tab()
+
+            self.tab_profile = ttk.Frame(self.notebook)
+            self.notebook.add(self.tab_profile, text="  My Profile & Security  ")
+            self.build_profile_tab()
+
+        if self.role == "ADMIN":
+            self.tab_approvals = ttk.Frame(self.notebook)
+            self.notebook.add(self.tab_approvals, text="  Admin Approvals & Loan Audit  ")
+            self.build_admin_approvals_tab()
+
+        self.build_inventory_tab()
+        self.load_data()
+        self.auto_refresh()
+
+    def build_inventory_tab(self):
+        f = self.tab_inventory
+
+        # Live Search & Filter Bar
+        frame_filter = tk.LabelFrame(f, text="🔍 Search & Filter Components", padx=8, pady=4)
+        frame_filter.pack(fill="x", padx=5, pady=3)
+
+        tk.Label(frame_filter, text="Search Name:").pack(side="left", padx=4)
+        self.ent_search = tk.Entry(frame_filter, width=20)
+        self.ent_search.pack(side="left", padx=4)
+        self.ent_search.bind("<KeyRelease>", lambda e: self.load_data())
+
+        tk.Label(frame_filter, text="Category:").pack(side="left", padx=(10, 4))
+        self.combo_cat_filter = ttk.Combobox(frame_filter, state="readonly", width=14)
+        self.combo_cat_filter.pack(side="left", padx=4)
+        self.update_category_filter()
+        self.combo_cat_filter.bind("<<ComboboxSelected>>", lambda e: self.load_data())
+
+        self.lbl_asset_val = tk.Label(
+            f, text="Total Valuation: P0.00",
+            font=("Arial", 10, "bold"), bg="#37474F", fg="#00E676", pady=4,
+        )
+        self.lbl_asset_val.pack(fill="x", pady=2)
+
+        if self.role == "ADMIN":
+            frame_form = tk.LabelFrame(f, text="Admin Controls - Add Component", padx=10, pady=4)
+            frame_form.pack(fill="x", padx=5, pady=3)
+
+            tk.Label(frame_form, text="Item Name:").grid(row=0, column=0, sticky="e")
+            self.ent_name = tk.Entry(frame_form, width=16)
+            self.ent_name.grid(row=0, column=1, padx=4, pady=2)
+
+            tk.Label(frame_form, text="Category:").grid(row=0, column=2, sticky="e")
+            self.ent_cat = tk.Entry(frame_form, width=16)
+            self.ent_cat.grid(row=0, column=3, padx=4, pady=2)
+
+            tk.Label(frame_form, text="Quantity:").grid(row=1, column=0, sticky="e")
+            self.ent_qty = tk.Entry(frame_form, width=16)
+            self.ent_qty.grid(row=1, column=1, padx=4, pady=2)
+
+            tk.Label(frame_form, text="Unit Price (P):").grid(row=1, column=2, sticky="e")
+            self.ent_price = tk.Entry(frame_form, width=16)
+            self.ent_price.grid(row=1, column=3, padx=4, pady=2)
+
+            tk.Button(
+                frame_form, text="Save Hardware Item", command=self.add_item,
+                bg="#4CAF50", fg="white", font=("Arial", 9, "bold"),
+            ).grid(row=2, column=0, columnspan=4, sticky="ew", pady=3)
+
+        # Treeview Data Grid
+        frame_table = tk.Frame(f)
+        frame_table.pack(fill="both", expand=True, padx=5, pady=4)
+
+        scroll_y = tk.Scrollbar(frame_table, orient=tk.VERTICAL)
+        self.tree = ttk.Treeview(
+            frame_table,
+            columns=("Select", "ID", "Name", "Category", "Qty", "Price", "Status"),
+            show="headings",
+            yscrollcommand=scroll_y.set,
+        )
+        scroll_y.config(command=self.tree.yview)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.heading("Select", text="[ ✓ ]")
+        self.tree.column("Select", width=45, anchor="center")
+
+        for col in ("ID", "Name", "Category", "Qty", "Price", "Status"):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center")
+        self.tree.column("ID", width=40)
+        self.tree.column("Name", width=180)
+        self.tree.pack(fill="both", expand=True)
+
+        self.tree.bind("<Button-1>", self.on_inventory_tree_click)
+
+        self.tree.tag_configure("Out of Stock", background="#FFCDD2")
+        self.tree.tag_configure("Low Stock", background="#FFF9C4")
+        self.tree.tag_configure("In Stock", background="#E8F5E9")
+
+        # Action Buttons
+        btn_action_frame = tk.Frame(f)
+        btn_action_frame.pack(fill="x", padx=5, pady=(4, 8))
+
+        if self.role == "USER":
+            tk.Button(
+                btn_action_frame, text="📦 Borrow Selected Component (☑)", command=self.borrow_selected_item,
+                bg="#0288D1", fg="white", font=("Arial", 9, "bold"),
+            ).pack(side="left", padx=(0, 10))
+
+        if self.role == "ADMIN":
+            tk.Button(
+                btn_action_frame, text="🗑️ Delete Selected (☑)", command=self.delete_selected_items,
+                bg="#D32F2F", fg="white", font=("Arial", 9, "bold"),
+            ).pack(side="left", padx=(0, 10))
+
+        tk.Button(
+            btn_action_frame, text="Export Inventory to CSV Report", command=self.export_csv,
+            bg="#673AB7", fg="white", font=("Arial", 9, "bold"),
+        ).pack(side="right", fill="x", expand=True)
+
+    def build_loans_tab(self):
+        f = self.tab_loans
+
+        # 1. USER ACTIVE BORROWED ITEMS
+        tk.Label(f, text="📦 Currently Borrowed (Tick to Request Return)", font=("Arial", 10, "bold"), fg="#0288D1").pack(pady=(4, 2))
+
+        frame_active = tk.Frame(f)
+        frame_active.pack(fill="both", expand=True, padx=10, pady=2)
+
+        scroll_act = tk.Scrollbar(frame_active, orient=tk.VERTICAL)
+        self.tree_loans = ttk.Treeview(
+            frame_active,
+            columns=("Select", "Loan ID", "Item Name", "Borrow Date", "Status"),
+            show="headings",
+            height=4,
+            yscrollcommand=scroll_act.set,
+        )
+        scroll_act.config(command=self.tree_loans.yview)
+        scroll_act.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree_loans.heading("Select", text="[ ✓ ]")
+        self.tree_loans.column("Select", width=45, anchor="center")
+
+        for col in ("Loan ID", "Item Name", "Borrow Date", "Status"):
+            self.tree_loans.heading(col, text=col)
+            self.tree_loans.column(col, anchor="center")
+        self.tree_loans.column("Loan ID", width=70)
+        self.tree_loans.pack(fill="both", expand=True)
+
+        self.tree_loans.bind("<Button-1>", self.on_loans_tree_click)
+        self.tree_loans.tag_configure("RETURN_PENDING", background="#FFF9C4", foreground="#E65100")
+        self.tree_loans.tag_configure("BORROWED", background="#E1F5FE", foreground="#01579B")
+
+        tk.Button(
+            f, text="🔄 Request Return for Selected (☑)", command=self.request_selected_returns,
+            bg="#FF9800", fg="white", font=("Arial", 9, "bold"), width=34,
+        ).pack(pady=4)
+
+        # 2. USER FULL LOAN HISTORY
+        tk.Label(f, text="📜 My Borrow & Return History", font=("Arial", 10, "bold"), fg="#37474F").pack(pady=(6, 2))
+
+        frame_hist = tk.Frame(f)
+        frame_hist.pack(fill="both", expand=True, padx=10, pady=(2, 6))
+
+        scroll_hist = tk.Scrollbar(frame_hist, orient=tk.VERTICAL)
+        self.tree_user_hist = ttk.Treeview(
+            frame_hist,
+            columns=("Loan ID", "Item Name", "Borrow Date", "Return Date", "Status"),
+            show="headings",
+            height=5,
+            yscrollcommand=scroll_hist.set,
+        )
+        scroll_hist.config(command=self.tree_user_hist.yview)
+        scroll_hist.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for col in ("Loan ID", "Item Name", "Borrow Date", "Return Date", "Status"):
+            self.tree_user_hist.heading(col, text=col)
+            self.tree_user_hist.column(col, anchor="center")
+        self.tree_user_hist.column("Loan ID", width=70)
+        self.tree_user_hist.pack(fill="both", expand=True)
+
+        self.tree_user_hist.tag_configure("RETURNED", background="#E8F5E9", foreground="#2E7D32")
+        self.tree_user_hist.tag_configure("RETURN_PENDING", background="#FFF9C4", foreground="#E65100")
+        self.tree_user_hist.tag_configure("BORROWED", background="#E1F5FE", foreground="#01579B")
+
+    def build_profile_tab(self):
+        f = self.tab_profile
+
+        frame_info = tk.LabelFrame(f, text="Account Overview", padx=15, pady=10)
+        frame_info.pack(fill="x", padx=20, pady=10)
+
+        tk.Label(frame_info, text=f"Username: {self.active_user}", font=("Arial", 10, "bold")).pack(anchor="w", pady=2)
+        tk.Label(frame_info, text=f"Registered Email: {self.email}", font=("Arial", 10)).pack(anchor="w", pady=2)
+        tk.Label(frame_info, text=f"Account Role: {self.role}", font=("Arial", 10, "italic"), fg="#0288D1").pack(anchor="w", pady=2)
+
+        frame_pw = tk.LabelFrame(f, text="Update Password Directly", padx=15, pady=10)
+        frame_pw.pack(fill="x", padx=20, pady=10)
+
+        tk.Label(frame_pw, text="Current Password:").pack(anchor="w", pady=(5, 2))
+        self.ent_prof_old = tk.Entry(frame_pw, show="*", width=30)
+        self.ent_prof_old.pack(anchor="w", pady=(0, 5))
+
+        tk.Label(frame_pw, text="New Password:").pack(anchor="w", pady=(5, 2))
+        self.ent_prof_new = tk.Entry(frame_pw, show="*", width=30)
+        self.ent_prof_new.pack(anchor="w", pady=(0, 5))
+
+        tk.Button(
+            frame_pw, text="Update Password", command=self.handle_direct_password_change,
+            bg="#FF9800", fg="white", font=("Arial", 9, "bold"), width=20,
+        ).pack(anchor="w", pady=10)
+
+    def build_admin_approvals_tab(self):
+        f = self.tab_approvals
+
+        # 1. PENDING RETURN APPROVALS
+        lbl_returns = tk.Label(
+            f, text="🔄 Pending Hardware Return Approvals (Tick to Approve Restock or Reject)",
+            font=("Arial", 10, "bold"), fg="#E65100",
+        )
+        lbl_returns.pack(pady=(4, 1))
+
+        frame_ret = tk.Frame(f)
+        frame_ret.pack(fill="both", expand=True, padx=10, pady=2)
+
+        scroll_ret = tk.Scrollbar(frame_ret, orient=tk.VERTICAL)
+        self.tree_returns = ttk.Treeview(
+            frame_ret,
+            columns=("Select", "Loan ID", "Username", "Item Name", "Borrow Date", "Return Requested"),
+            show="headings",
+            height=3,
+            yscrollcommand=scroll_ret.set,
+        )
+        scroll_ret.config(command=self.tree_returns.yview)
+        scroll_ret.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree_returns.heading("Select", text="[ ✓ ]")
+        self.tree_returns.column("Select", width=45, anchor="center")
+
+        for col in ("Loan ID", "Username", "Item Name", "Borrow Date", "Return Requested"):
+            self.tree_returns.heading(col, text=col)
+            self.tree_returns.column(col, anchor="center")
+        self.tree_returns.column("Loan ID", width=65)
+        self.tree_returns.pack(fill="both", expand=True)
+
+        self.tree_returns.bind("<Button-1>", self.on_returns_tree_click)
+
+        btn_ret_frame = tk.Frame(f)
+        btn_ret_frame.pack(pady=2)
+
+        tk.Button(
+            btn_ret_frame, text="✅ Approve Return & Restock (☑)", command=lambda: self.handle_bulk_return_action(True),
+            bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=24,
+        ).pack(side="left", padx=8)
+        tk.Button(
+            btn_ret_frame, text="❌ Reject Return Request (☑)", command=lambda: self.handle_bulk_return_action(False),
+            bg="#F44336", fg="white", font=("Arial", 9, "bold"), width=24,
+        ).pack(side="right", padx=8)
+
+        # 2. GLOBAL SYSTEM-WIDE LOAN AUDIT TRAIL
+        lbl_all_loans = tk.Label(
+            f, text="📋 All Borrowed & Returned Equipment Audit History",
+            font=("Arial", 10, "bold"), fg="#1976D2",
+        )
+        lbl_all_loans.pack(pady=(4, 1))
+
+        frame_all_loans = tk.Frame(f)
+        frame_all_loans.pack(fill="both", expand=True, padx=10, pady=2)
+
+        scroll_all_loans = tk.Scrollbar(frame_all_loans, orient=tk.VERTICAL)
+        self.tree_admin_loan_hist = ttk.Treeview(
+            frame_all_loans,
+            columns=("Loan ID", "Username", "Item Name", "Borrow Date", "Return Date", "Status"),
+            show="headings",
+            height=3,
+            yscrollcommand=scroll_all_loans.set,
+        )
+        scroll_all_loans.config(command=self.tree_admin_loan_hist.yview)
+        scroll_all_loans.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for col in ("Loan ID", "Username", "Item Name", "Borrow Date", "Return Date", "Status"):
+            self.tree_admin_loan_hist.heading(col, text=col)
+            self.tree_admin_loan_hist.column(col, anchor="center")
+        self.tree_admin_loan_hist.column("Loan ID", width=65)
+        self.tree_admin_loan_hist.pack(fill="both", expand=True)
+
+        self.tree_admin_loan_hist.tag_configure("RETURNED", background="#E8F5E9", foreground="#2E7D32")
+        self.tree_admin_loan_hist.tag_configure("RETURN_PENDING", background="#FFF9C4", foreground="#E65100")
+        self.tree_admin_loan_hist.tag_configure("BORROWED", background="#E1F5FE", foreground="#01579B")
+
+        # 3. PENDING PASSWORD RESET REQUESTS
+        lbl_pending = tk.Label(
+            f, text="🔑 Password Reset Requests (Tick to Approve or Reject)",
+            font=("Arial", 10, "bold"), fg="#D32F2F",
+        )
+        lbl_pending.pack(pady=(4, 1))
+
+        frame_pending = tk.Frame(f)
+        frame_pending.pack(fill="both", expand=True, padx=10, pady=2)
+
+        scroll_pending = tk.Scrollbar(frame_pending, orient=tk.VERTICAL)
+        self.tree_resets = ttk.Treeview(
+            frame_pending,
+            columns=("Select", "Request ID", "Username", "Email", "Timestamp"),
+            show="headings",
+            height=3,
+            yscrollcommand=scroll_pending.set,
+        )
+        scroll_pending.config(command=self.tree_resets.yview)
+        scroll_pending.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree_resets.heading("Select", text="[ ✓ ]")
+        self.tree_resets.column("Select", width=45, anchor="center")
+
+        for col in ("Request ID", "Username", "Email", "Timestamp"):
+            self.tree_resets.heading(col, text=col)
+            self.tree_resets.column(col, anchor="center")
+        self.tree_resets.column("Request ID", width=75)
+        self.tree_resets.pack(fill="both", expand=True)
+
+        self.tree_resets.bind("<Button-1>", self.on_resets_tree_click)
+
+        btn_frame = tk.Frame(f)
+        btn_frame.pack(pady=2)
+
+        tk.Button(
+            btn_frame, text="✅ Approve Reset (☑)", command=lambda: self.handle_bulk_reset_action(True),
+            bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=20,
+        ).pack(side="left", padx=8)
+        tk.Button(
+            btn_frame, text="❌ Reject Reset (☑)", command=lambda: self.handle_bulk_reset_action(False),
+            bg="#F44336", fg="white", font=("Arial", 9, "bold"), width=20,
+        ).pack(side="right", padx=8)
+
+    # --- EVENT & ACTION HANDLERS ---
+    def update_category_filter(self):
+        cats = InventoryController.get_categories()
+        self.combo_cat_filter["values"] = cats
+        if not self.combo_cat_filter.get() or self.combo_cat_filter.get() not in cats:
+            self.combo_cat_filter.current(0)
+
+    def on_inventory_tree_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            db_id = int(self.tree.item(item_id, "values")[1])
+            if db_id in self.selected_inv_ids:
+                self.selected_inv_ids.remove(db_id)
+            else:
+                self.selected_inv_ids.add(db_id)
+            self.load_data()
+
+    def on_loans_tree_click(self, event):
+        item_id = self.tree_loans.identify_row(event.y)
+        if item_id:
+            loan_id = int(self.tree_loans.item(item_id, "values")[1])
+            if loan_id in self.selected_loan_ids:
+                self.selected_loan_ids.remove(loan_id)
+            else:
+                self.selected_loan_ids.add(loan_id)
+            self.load_loans_data()
+
+    def on_resets_tree_click(self, event):
+        item_id = self.tree_resets.identify_row(event.y)
+        if item_id:
+            req_id = int(self.tree_resets.item(item_id, "values")[1])
+            if req_id in self.selected_reset_ids:
+                self.selected_reset_ids.remove(req_id)
+            else:
+                self.selected_reset_ids.add(req_id)
+            self.load_admin_panel_data()
+
+    def on_returns_tree_click(self, event):
+        item_id = self.tree_returns.identify_row(event.y)
+        if item_id:
+            loan_id = int(self.tree_returns.item(item_id, "values")[1])
+            if loan_id in self.selected_return_ids:
+                self.selected_return_ids.remove(loan_id)
+            else:
+                self.selected_return_ids.add(loan_id)
+            self.load_admin_panel_data()
+
+    def borrow_selected_item(self):
+        if not self.selected_inv_ids:
+            messagebox.showwarning("Selection Required", "Please tick (☑) a component to borrow.")
+            return
+
+        if len(self.selected_inv_ids) > 1:
+            messagebox.showwarning("Multiple Items", "Please borrow components one at a time.")
+            return
+
+        item_id = list(self.selected_inv_ids)[0]
+        ok, msg = InventoryController.borrow_item(self.active_user, item_id)
+        if ok:
+            messagebox.showinfo("Borrowed", msg)
+            self.selected_inv_ids.clear()
+            self.load_data()
+            self.load_loans_data()
+        else:
+            messagebox.showerror("Error", msg)
+
+    def request_selected_returns(self):
+        if not self.selected_loan_ids:
+            messagebox.showwarning("Selection Required", "Please tick (☑) at least one borrowed item to return.")
+            return
+
+        ok, msg = InventoryController.request_bulk_item_returns(list(self.selected_loan_ids))
+        if ok:
+            messagebox.showinfo("Request Sent", msg)
+            self.selected_loan_ids.clear()
+            self.load_loans_data()
+        else:
+            messagebox.showwarning("Notice", msg)
+
+    def handle_bulk_return_action(self, approve):
+        if not self.selected_return_ids:
+            messagebox.showwarning("Selection Required", "Please tick (☑) at least one return request.")
+            return
+
+        ok, msg = InventoryController.process_bulk_returns(list(self.selected_return_ids), approve=approve)
+        if ok:
+            messagebox.showinfo("Result", msg)
+            self.selected_return_ids.clear()
+            self.load_data()
+            self.load_admin_panel_data()
+        else:
+            messagebox.showerror("Error", msg)
+
+    def handle_direct_password_change(self):
+        old_p = self.ent_prof_old.get()
+        new_p = self.ent_prof_new.get()
+        if not old_p or not new_p:
+            messagebox.showerror("Error", "Both current and new passwords are required.")
+            return
+
+        ok, msg = AuthController.change_password_direct(self.active_user, self.email, old_p, new_p)
+        if ok:
+            messagebox.showinfo("Success", msg)
+            self.ent_prof_old.delete(0, tk.END)
+            self.ent_prof_new.delete(0, tk.END)
+        else:
+            messagebox.showerror("Update Failed", msg)
+
+    def handle_bulk_reset_action(self, approve):
+        if not self.selected_reset_ids:
+            messagebox.showwarning("Selection Required", "Please tick (☑) at least one reset request.")
+            return
+
+        ok, msg = AuthController.process_bulk_resets(list(self.selected_reset_ids), approve=approve)
+        if ok:
+            messagebox.showinfo("Result", msg)
+            self.selected_reset_ids.clear()
+            self.load_admin_panel_data()
+        else:
+            messagebox.showerror("Error", msg)
+
+    def delete_selected_items(self):
+        if not self.selected_inv_ids:
+            messagebox.showwarning("Selection Required", "Please tick (☑) at least one item to delete.")
+            return
+
+        if messagebox.askyesno("Confirm Deletion", f"Delete {len(self.selected_inv_ids)} selected item(s)?"):
+            ok, msg = InventoryController.delete_bulk_items(list(self.selected_inv_ids))
+            if ok:
+                messagebox.showinfo("Deleted", msg)
+                self.selected_inv_ids.clear()
+                self.load_data()
+                self.update_category_filter()
+            else:
+                messagebox.showerror("Error", msg)
+
+    def add_item(self):
+        try:
+            name = self.ent_name.get().strip()
+            cat = self.ent_cat.get().strip()
+            qty = int(self.ent_qty.get().strip())
+            price = float(self.ent_price.get().strip())
+        except ValueError:
+            messagebox.showerror("Error", "Quantity must be an integer and Unit Price numeric.")
+            return
+
+        ok, msg = InventoryController.add_item(name, cat, qty, price)
+        if ok:
+            messagebox.showinfo("Success", msg)
+            self.ent_name.delete(0, tk.END)
+            self.ent_cat.delete(0, tk.END)
+            self.ent_qty.delete(0, tk.END)
+            self.ent_price.delete(0, tk.END)
+            self.load_data()
+            self.update_category_filter()
+        else:
+            messagebox.showerror("Error", msg)
+
+    def load_data(self):
+        search_txt = self.ent_search.get().strip() if hasattr(self, "ent_search") else ""
+        selected_cat = self.combo_cat_filter.get() if hasattr(self, "combo_cat_filter") else "ALL"
+
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        rows = InventoryController.get_all_items(search_text=search_txt, category=selected_cat)
+        for r in rows:
+            box = "☑" if r[0] in self.selected_inv_ids else "☐"
+            row_vals = (box, r[0], r[1], r[2], r[3], r[4], r[5])
+            self.tree.insert("", tk.END, values=row_vals, tags=(r[5],))
+
+        total = InventoryController.get_total_asset_value()
+        self.lbl_asset_val.config(text=f"Total Asset Valuation: P{total:,.2f}")
+
+    def load_loans_data(self):
+        if self.role == "USER":
+            # 1. Active Loans
+            if hasattr(self, "tree_loans"):
+                for row in self.tree_loans.get_children():
+                    self.tree_loans.delete(row)
+                loans = InventoryController.get_user_active_loans(self.active_user)
+                for l in loans:
+                    box = "☑" if l[0] in self.selected_loan_ids else "☐"
+                    row_vals = (box, l[0], l[1], l[2], l[3])
+                    self.tree_loans.insert("", tk.END, values=row_vals, tags=(l[3],))
+
+            # 2. Full History
+            if hasattr(self, "tree_user_hist"):
+                for row in self.tree_user_hist.get_children():
+                    self.tree_user_hist.delete(row)
+                hist = InventoryController.get_user_loan_history(self.active_user)
+                for h in hist:
+                    ret_str = h[3] if h[3] else "—"
+                    row_vals = (h[0], h[1], h[2], ret_str, h[4])
+                    self.tree_user_hist.insert("", tk.END, values=row_vals, tags=(h[4],))
+
+    def load_admin_panel_data(self):
+        if self.role == "ADMIN":
+            # 1. Pending Returns
+            if hasattr(self, "tree_returns"):
+                for row in self.tree_returns.get_children():
+                    self.tree_returns.delete(row)
+                returns = InventoryController.get_pending_returns()
+                for ret in returns:
+                    box = "☑" if ret[0] in self.selected_return_ids else "☐"
+                    row_vals = (box, ret[0], ret[1], ret[2], ret[3], ret[4])
+                    self.tree_returns.insert("", tk.END, values=row_vals)
+
+            # 2. System-wide Loan History
+            if hasattr(self, "tree_admin_loan_hist"):
+                for row in self.tree_admin_loan_hist.get_children():
+                    self.tree_admin_loan_hist.delete(row)
+                all_loans = InventoryController.get_all_loans_history()
+                for al in all_loans:
+                    ret_str = al[4] if al[4] else "—"
+                    row_vals = (al[0], al[1], al[2], al[3], ret_str, al[5])
+                    self.tree_admin_loan_hist.insert("", tk.END, values=row_vals, tags=(al[5],))
+
+            # 3. Pending Password Resets
+            if hasattr(self, "tree_resets"):
+                for row in self.tree_resets.get_children():
+                    self.tree_resets.delete(row)
+                resets = AuthController.get_pending_resets()
+                for r in resets:
+                    box = "☑" if r[0] in self.selected_reset_ids else "☐"
+                    row_vals = (box, r[0], r[1], r[2], r[3])
+                    self.tree_resets.insert("", tk.END, values=row_vals)
+
+    def export_csv(self):
+        ok, msg = InventoryController.export_to_csv(self.active_user)
+        if ok:
+            messagebox.showinfo("Report Exported", msg)
+        else:
+            messagebox.showerror("Error", msg)
+
+    def logout(self):
+        logger.info(f"User '{self.active_user}' logged out.")
+        self.on_logout()
+
+    def auto_refresh(self):
+        try:
+            if hasattr(self, "tree") and bool(self.tree.winfo_exists()):
+                self.load_data()
+                if self.role == "ADMIN":
+                    self.load_admin_panel_data()
+                elif self.role == "USER":
+                    self.load_loans_data()
+                self.root.after(2500, self.auto_refresh)
+        except Exception:
+            pass
+
+
+# ==============================================================================
+# 6. APPLICATION ENTRY POINT
+# ==============================================================================
+def start_app():
+    global root
+    root = tk.Tk()
+
+    def launch_inventory(username, role, email):
+        for widget in root.winfo_children():
+            widget.destroy()
+        InventoryView(root, active_user=username, role=role, email=email, on_logout=restart_auth)
+
+    def restart_auth():
+        for widget in root.winfo_children():
+            widget.destroy()
+        AuthView(root, on_success=launch_inventory)
+
+    AuthView(root, on_success=launch_inventory)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    init_db()
+    start_app()
