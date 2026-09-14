@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Login | Laboratory System{% endblock %}
+{% block content %}
+<section class="auth-page">
+  <div class="auth-brand-panel">
+    <div class="auth-logo">NU</div>
+    <p class="eyebrow">NU HARDWARE INVENTORY</p>
+    <h1>Manage your laboratory equipment with ease.</h1>
+    <p class="auth-description">Access the inventory catalog, borrowing records, returns, and administrative tools from one place.</p>
+    <div class="feature-list">
+      <div><span>✓</span><p><strong>Hardware Catalog</strong><small>View equipment, quantities, prices, and stock status.</small></p></div>
+      <div><span>✓</span><p><strong>Borrow & Return</strong><small>Track active loans and submit return requests.</small></p></div>
+      <div><span>✓</span><p><strong>Secure Accounts</strong><small>Protected login with password and lockout controls.</small></p></div>
+    </div>
+  </div>
+  <div class="auth-card">
+    <div class="card-heading">
+      <p class="eyebrow">WELCOME BACK</p>
+      <h2>Sign in to your account</h2>
+      <p class="muted">Enter your Laboratory System credentials to continue.</p>
+    </div>
+    {% if locked %}
+      <div class="inline-alert warning"><strong>Account locked.</strong><span>Use the Reset / Unlock Password page to submit a request.</span></div>
+    {% endif %}
+    <form method="post" action="{{ url_for('login') }}" class="auth-form">
+      <label for="username">Username</label>
+      <div class="input-wrap"><span>👤</span><input id="username" name="username" autocomplete="username" placeholder="Enter your username" required></div>
+      <label for="password">Password</label>
+      <div class="input-wrap"><span>🔒</span><input id="password" type="password" name="password" autocomplete="current-password" placeholder="Enter your password" required></div>
+      <button class="primary wide" type="submit">Login to System <span>→</span></button>
+    </form>
+    <div class="auth-actions">
+      <a href="{{ url_for('register') }}" class="outline-action"><span>＋</span><span><strong>Create an Account</strong><small>New to the system?</small></span></a>
+      <a href="{{ url_for('reset_request') }}" class="outline-action"><span>↻</span><span><strong>Reset / Unlock Password</strong><small>Forgot your password or locked out?</small></span></a>
+    </div>
+    <p class="security-note">🔐 Your account is protected by the system's authentication and lockout rules.</p>
+  </div>
+</section>
+{% endblock %}

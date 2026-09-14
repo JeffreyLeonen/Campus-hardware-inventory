@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Dashboard | Laboratory System{% endblock %}
+{% block content %}
+<script>
+function updateSelectionButtons() {
+  document.querySelectorAll('.selection-action-form').forEach(function(form) {
+    const boxes = form.querySelectorAll('input[type="checkbox"]');
+    const selected = Array.from(boxes).some(function(box) { return box.checked; });
+    form.querySelectorAll('button[data-selection-action="true"]').forEach(function(button) { button.disabled = !selected; });
+  });
+  const itemBoxes = document.querySelectorAll('.item-select');
+  const itemSelected = Array.from(itemBoxes).some(function(box) { return box.checked; });
+  const deleteButton = document.getElementById('delete-button');
+  if (deleteButton) deleteButton.disabled = !itemSelected;
+  const selectAll = document.getElementById('select-all-items');
+  if (selectAll && itemBoxes.length) {
+    selectAll.checked = Array.from(itemBoxes).every(function(box) { return box.checked; });
+    selectAll.indeterminate = itemSelected && !selectAll.checked;
+  }
+}
+function confirmSelected(form, message) {
+  const boxes = form.querySelectorAll('input[type="checkbox"]');
+  if (!Array.from(boxes).some(function(box) { return box.checked; })) { alert('Please select at least one item.'); return false; }
+  return confirm(message);
+}
+document.addEventListener('DOMContentLoaded', function() {
+  document.querySelectorAll('input[type="checkbox"]').forEach(function(box) { box.addEventListener('change', updateSelectionButtons); });
+  const selectAll = document.getElementById('select-all-items');
+  if (selectAll) selectAll.addEventListener('change', function() { document.querySelectorAll('.item-select').forEach(function(box) { box.checked = selectAll.checked; }); updateSelectionButtons(); });
+  updateSelectionButtons();
+});
+</script>
+
+<section class="dashboard-hero">
+  <div>
+    <p class="eyebrow">LABORATORY DASHBOARD</p>
+    <h1>Good day, {{ session.username }}! <span>👋</span></h1>
+    <p>Manage campus equipment, inventory records, and laboratory transactions.</p>
+  </div>
+  <a class="primary action-button" href="{{ url_for('export') }}">⇩ Export Inventory CSV</a>
+</section>
+
+<section class="stats">
+  {% if session.role=='ADMIN' %}
+  <div class="stat-card"><div class="stat-icon green">▣</div><div><span>Borrowed Items</span><strong>{{ all_loans|selectattr("6", "equalto", "BORROWED")|list|length }}</strong><small>Currently borrowed</small></div></div>
+  <div class="stat-card"><div class="stat-icon blue">↗</div><div><span>Pending Borrow Requests</span><strong>{{ pending_borrows|length }}</strong><small>Awaiting approval</small></div></div>
+  <div class="stat-card"><div class="stat-icon purple">↩</div><div><span>Pending Returns</span><strong>{{ pending_returns|length }}</strong><small>Awaiting approval</small></div></div>
+  <div class="stat-card"><div class="stat-icon blue">▣</div><div><span>Password Reset Requests</span><strong>{{ pending_resets|length }}</strong><small>Awaiting approval</small></div></div>
+  {% else %}
+  <div class="stat-card"><div class="stat-icon green">▣</div><div><span>Borrowed Items</span><strong>{{ active_loans|length }}</strong><small>Currently borrowed</small></div></div>
+  <div class="stat-card"><div class="stat-icon blue">↗</div><div><span>Pending Borrow Requests</span><strong>{{ pending_borrow_requests|length }}</strong><small>Awaiting Admin approval</small></div></div>
+  {% endif %}
+  <div class="stat-card"><div class="stat-icon purple">▦</div><div><span>Total Stocks</span><strong>{{ items | map(attribute=3) | sum }}</strong><small>All inventory quantities</small></div></div>
+  <div class="stat-card"><div class="stat-icon blue">●</div><div><span>Account Role</span><strong>{{ session.role }}</strong><small>{% if session.role == 'ADMIN' %}Administrator access{% else %}Standard user access{% endif %}</small></div></div>
+</section>
+
+<section class="card catalog-card">
+  <div class="section-heading"><div><p class="eyebrow">INVENTORY</p><h2>Hardware Catalog</h2><p class="muted">Search, filter, and manage available laboratory equipment.</p></div></div>
+  <form class="filters" method="get" action="{{ url_for('dashboard') }}">
+    <div class="search-box"><span>⌕</span><input name="search" value="{{ search }}" placeholder="Search item name"></div>
+    <select name="category">{% for c in categories %}<option value="{{ c }}" {% if c==selected_category %}selected{% endif %}>{{ c }}</option>{% endfor %}</select>
+    <button class="primary" type="submit">Search / Filter</button>
+  </form>
+  <div class="table-wrap"><table class="data-table">
+    <thead><tr><th>ID</th><th>Equipment</th><th>Category</th><th>Quantity</th><th>Unit Price</th><th>Status</th>{% if session.role=='USER' %}<th>Action</th>{% endif %}{% if session.role=='ADMIN' %}<th class="select-cell"><label>Select <input type="checkbox" id="select-all-items"></label></th>{% endif %}</tr></thead>
+    <tbody>
+    {% for r in items %}<tr><td class="id-cell">#{{ r[0] }}</td><td><strong>{{ r[1] }}</strong></td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>₱{{ "{:,.2f}".format(r[4]) }}</td><td><span class="status {{ r[5]|lower|replace(' ','-') }}"><i></i>{{ r[5] }}</span></td>
+    {% if session.role=='USER' %}<td><form class="borrow-form" method="post" action="{{ url_for('borrow') }}"><input type="hidden" name="item_id" value="{{ r[0] }}"><input class="quantity-input" name="quantity" type="number" min="1" max="{{ r[3] }}" value="1" aria-label="Quantity to borrow" {% if r[3] <= 0 %}disabled{% endif %}><button class="small primary" type="submit" {% if r[3] <= 0 %}disabled{% endif %}>Request Borrow</button></form></td>{% endif %}
+    {% if session.role=='ADMIN' %}<td class="select-cell"><input class="item-select" type="checkbox" name="item_ids" value="{{ r[0] }}" form="delete-form"></td>{% endif %}</tr>
+    {% else %}<tr><td class="empty-cell" colspan="8"><div>📦</div><strong>No items found</strong><span>Try another search or category.</span></td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% if session.role=='ADMIN' %}<form id="delete-form" method="post" action="{{ url_for('admin_delete') }}" onsubmit="return confirmSelected(this, 'Delete the selected hardware item(s)?');"><button id="delete-button" class="danger-button" type="submit" disabled>🗑 Delete Selected Items</button></form>{% endif %}
+</section>
+
+{% if session.role=='ADMIN' %}
+<section class="section-grid">
+  <section class="card"><div class="section-heading compact"><div><p class="eyebrow">ADMINISTRATION</p><h2>Add Hardware</h2></div><span class="heading-icon">＋</span></div>
+    <form class="grid-form" method="post" action="{{ url_for('admin_add') }}"><div><label>Item Name</label><input name="item_name" placeholder="e.g. Arduino Uno" required></div><div><label>Category</label><input name="category" placeholder="e.g. Microcontroller" required></div><div><label>Quantity</label><input name="quantity" type="number" min="0" placeholder="0" required></div><div><label>Unit Price</label><input name="unit_price" type="number" min="0.01" step="0.01" placeholder="0.00" required></div><button class="primary" type="submit">Add Hardware</button></form>
+  </section>
+  <section class="card info-card"><div class="section-heading compact"><div><p class="eyebrow">ACCOUNT</p><h2>Administrator</h2></div><span class="heading-icon">★</span></div><p>You can manage inventory, approve borrow and return requests, process password resets, and review the loan audit.</p><div class="mini-list"><span>✓ Inventory management</span><span>✓ Borrow approvals</span><span>✓ Return approvals</span><span>✓ Password reset approvals</span></div></section>
+</section>
+
+<section class="card"><div class="section-heading"><div><p class="eyebrow">WORKFLOW</p><h2>Pending Borrow Requests</h2><p class="muted">Review user requests before releasing laboratory equipment.</p></div></div>
+<form class="selection-action-form" method="post" action="{{ url_for('admin_borrow_action') }}" onsubmit="return confirmSelected(this, this.querySelector('[name=action]:focus')?.value === 'reject' ? 'Reject the selected borrow request(s)?' : 'Approve the selected borrow request(s) and release the equipment?');">
+{% for r in pending_borrows %}<label class="rowcheck"><input type="checkbox" name="loan_ids" value="{{ r[0] }}"><span><strong>#{{ r[0] }} · {{ r[1] }}</strong><small>{{ r[2] }} · quantity: {{ r[3] }} · requested {{ r[4] }}</small></span></label>{% else %}<div class="empty-state">✓ <span><strong>No pending borrow requests</strong><small>There are no borrow requests waiting for approval.</small></span></div>{% endfor %}
+<div class="action-row"><button name="action" value="approve" data-selection-action="true" class="primary" type="submit" disabled>✓ Approve Borrow</button><button name="action" value="reject" data-selection-action="true" class="danger-button" type="submit" disabled>✕ Reject Borrow</button></div></form></section>
+
+<section class="card"><div class="section-heading"><div><p class="eyebrow">WORKFLOW</p><h2>Pending Returns</h2><p class="muted">Review user requests before restocking returned equipment.</p></div></div>
+<form class="selection-action-form" method="post" action="{{ url_for('admin_return_action') }}" onsubmit="return confirmSelected(this, this.querySelector('[name=action]:focus')?.value === 'reject' ? 'Reject the selected return request(s)?' : 'Approve the selected return request(s) and restock the items?');">
+{% for r in pending_returns %}<label class="rowcheck"><input type="checkbox" name="loan_ids" value="{{ r[0] }}"><span><strong>#{{ r[0] }} · {{ r[1] }}</strong><small>{{ r[2] }} · quantity: {{ r[3] }} · requested {{ r[5] }}</small></span></label>{% else %}<div class="empty-state">✓ <span><strong>No pending returns</strong><small>There are no return requests waiting for approval.</small></span></div>{% endfor %}
+<div class="action-row"><button name="action" value="approve" data-selection-action="true" class="primary" type="submit" disabled>✓ Approve & Restock</button><button name="action" value="reject" data-selection-action="true" class="danger-button" type="submit" disabled>✕ Reject Return</button></div></form></section>
+
+<section class="card"><div class="section-heading"><div><p class="eyebrow">SECURITY</p><h2>Pending Password Resets</h2><p class="muted">Approve reset requests to update passwords and unlock accounts.</p></div></div>
+<form class="selection-action-form" method="post" action="{{ url_for('admin_reset_action') }}" onsubmit="return confirmSelected(this, this.querySelector('[name=action]:focus')?.value === 'reject' ? 'Reject the selected password reset request(s)?' : 'Approve the selected password reset request(s) and unlock the account(s)?');">
+{% for r in pending_resets %}<label class="rowcheck"><input type="checkbox" name="request_ids" value="{{ r[0] }}"><span><strong>#{{ r[0] }} · {{ r[1] }}</strong><small>{{ r[2] }} · {{ r[3] }}</small></span></label>{% else %}<div class="empty-state">✓ <span><strong>No pending reset requests</strong><small>All password reset requests have been processed.</small></span></div>{% endfor %}
+<div class="action-row"><button name="action" value="approve" data-selection-action="true" class="primary" type="submit" disabled>✓ Approve & Unlock</button><button name="action" value="reject" data-selection-action="true" class="danger-button" type="submit" disabled>✕ Reject Reset</button></div></form></section>
+
+<section class="card"><div class="section-heading"><div><p class="eyebrow">RECORDS</p><h2>Borrow Audit</h2><p class="muted">System-wide history of equipment borrowing and returns.</p></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>ID</th><th>User</th><th>Item</th><th>Quantity</th><th>Borrow Date</th><th>Return Date</th><th>Status</th></tr></thead><tbody>{% for r in all_loans %}<tr><td>#{{r[0]}}</td><td>{{r[1]}}</td><td><strong>{{r[2]}}</strong></td><td>{{r[3]}}</td><td>{{r[4]}}</td><td>{{r[5] or '—'}}</td><td><span class="loan-status {{ r[6]|lower|replace('_','-') }}">{{r[6]}}</span></td></tr>{% else %}<tr><td colspan="7" class="empty-cell">No borrow history.</td></tr>{% endfor %}</tbody></table></div></section>
+{% else %}
+<section class="section-grid user-grid">
+<section class="card"><div class="section-heading"><div><p class="eyebrow">MY EQUIPMENT</p><h2>Borrowed Items</h2><p class="muted">Select equipment that you have returned and request Admin approval.</p></div></div><form class="selection-action-form" method="post" action="{{ url_for('return_request') }}" onsubmit="return confirmSelected(this, 'Submit a return request for the selected item(s)?');">
+{% for l in active_loans %}<label class="rowcheck"><input type="checkbox" name="loan_ids" value="{{ l[0] }}"><span><strong>#{{l[0]}} · {{l[1]}}</strong><small>Quantity: {{l[2]}} · borrowed {{l[3]}}</small></span></label>{% else %}<div class="empty-state">📭 <span><strong>No borrowed items</strong><small>You currently have no approved borrowed equipment.</small></span></div>{% endfor %}<button class="warning-btn" data-selection-action="true" type="submit" disabled>↩ Request Return</button></form></section>
+<section class="card profile-card"><div class="section-heading"><div><p class="eyebrow">MY ACCOUNT</p><h2>Profile & Security</h2></div><span class="heading-icon">👤</span></div><div class="profile-line"><span>Email</span><strong>{{ session.email }}</strong></div><form class="grid-form" method="post" action="{{ url_for('change_password') }}"><div><label>Current Password</label><input type="password" name="old_password" placeholder="Current password" required></div><div><label>New Password</label><input type="password" name="new_password" placeholder="New password" required></div><button class="warning-btn" type="submit">Update Password</button></form></section>
+</section>
+<section class="card"><div class="section-heading"><div><p class="eyebrow">MY REQUESTS</p><h2>Pending Borrow Requests</h2><p class="muted">Borrow requests waiting for Admin approval.</p></div></div>
+{% for r in pending_borrow_requests %}<div class="rowcheck"><span><strong>#{{r[0]}} · {{r[1]}}</strong><small>Quantity: {{r[2]}} · requested {{r[3]}} · {{r[4]}}</small></span></div>{% else %}<div class="empty-state">✓ <span><strong>No pending borrow requests</strong><small>Your approved or completed borrow requests will appear in your records.</small></span></div>{% endfor %}</section>
+<section class="card"><div class="section-heading"><div><p class="eyebrow">RECORDS</p><h2>My Borrow History</h2><p class="muted">Your previous borrowing and return transactions.</p></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>ID</th><th>Item</th><th>Quantity</th><th>Borrow Date</th><th>Return Date</th><th>Status</th></tr></thead><tbody>{% for h in history %}<tr><td>#{{h[0]}}</td><td><strong>{{h[1]}}</strong></td><td>{{h[2]}}</td><td>{{h[3]}}</td><td>{{h[4] or '—'}}</td><td><span class="loan-status {{ h[5]|lower|replace('_','-') }}">{{h[5]}}</span></td></tr>{% else %}<tr><td colspan="6" class="empty-cell">No borrow history.</td></tr>{% endfor %}</tbody></table></div></section>
+{% endif %}
+{% endblock %}

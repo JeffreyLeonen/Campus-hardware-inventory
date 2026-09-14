@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Create Account | Laboratory System{% endblock %}
+{% block content %}
+<section class="standalone-auth">
+  <div class="form-intro">
+    <div class="page-icon">＋</div>
+    <p class="eyebrow">ACCOUNT REGISTRATION</p>
+    <h1>Create your account</h1>
+    <p>Register for access to the Campus Hardware Inventory System.</p>
+  </div>
+  <div class="form-card">
+    <form method="post" action="{{ url_for('register') }}" class="auth-form">
+      <div class="form-section-title">Account Information</div>
+      <label for="username">Username</label>
+      <div class="input-wrap"><span>👤</span><input id="username" name="username" autocomplete="username" placeholder="Choose a username" required></div>
+      <label for="email">Email Address</label>
+      <div class="input-wrap"><span>✉</span><input id="email" type="email" name="email" autocomplete="email" placeholder="name@example.com" required></div>
+      <label for="password">Password</label>
+      <div class="input-wrap"><span>🔒</span><input id="password" type="password" name="password" autocomplete="new-password" placeholder="Create a secure password" required></div>
+      <label for="role">Account Role</label>
+      <select id="role" name="role"><option value="USER">USER — Standard account</option><option value="ADMIN">ADMIN — Administrator</option></select>
+      <div class="form-note">Choose the role appropriate for your laboratory activity. Administrator access provides additional management functions.</div>
+      <button class="primary wide" type="submit">Create Account <span>→</span></button>
+    </form>
+    <div class="back-link"><a href="{{ url_for('login') }}">← Back to Login</a></div>
+  </div>
+</section>
+{% endblock %}
