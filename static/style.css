@@ -9,4 +9,3 @@
 .borrow-form { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .quantity-input { width: 72px; padding: 9px 10px; border: 1px solid #d7dde7; border-radius: 10px; font: inherit; background: #fff; }
 .quantity-input:focus { outline: none; border-color: #8aa9d6; box-shadow: 0 0 0 3px rgba(60, 100, 160, .10); }
-
