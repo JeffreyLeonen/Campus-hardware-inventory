@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+app_logging/
+hardware_inventory.db
+Laboratorysystem_SQLite_BACKUP.py
+README_LAB2_NEXT_STEPS.md
