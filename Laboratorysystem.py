@@ -9,9 +9,17 @@ try:
     import psycopg
 except ImportError:
     psycopg = None
-import tkinter as tk
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    TKINTER_AVAILABLE = True
+except ImportError:
+    tk = None
+    messagebox = None
+    ttk = None
+    TKINTER_AVAILABLE = False
+
 from datetime import datetime
-from tkinter import messagebox, ttk
 
 import bcrypt
 from pydantic import BaseModel, Field, ValidationError, field_validator
