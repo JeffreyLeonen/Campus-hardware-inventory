@@ -25,7 +25,7 @@ The terminal also prints the portal address when the server starts.
 
 ## Important
 
-The original Tkinter desktop views remain in `Laboratorysystem.py` for teaching comparison. The web app does not call `start_app()`.
+The original Tkinter desktop views remain in `Laboratorysystem.py` for comparison. The web app does not call `start_app()`.
 
 ### Borrow Quantity
 
