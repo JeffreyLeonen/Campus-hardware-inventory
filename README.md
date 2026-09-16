@@ -1,6 +1,6 @@
-# Laboratory System — Web Lab 1 (NICE UI + Borrow Approval)
+# Laboratory System — Web Lab 1 (UI + Borrow Approval)
 
-This version keeps the polished NICE UI and reuses the original Python database/controller logic. Flask is the web bridge between the browser and the existing Python system.
+This version keeps the polished UI and reuses the original Python database/controller logic. Flask is the web bridge between the browser and the existing Python system.
 
 ## Run locally
 
